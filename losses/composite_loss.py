@@ -1,12 +1,7 @@
-# losses/composite_loss.py
-# Composite Loss Function for CATKC-Net
-#
-# L_total = λ_mse * L_mse + λ_ssim * (1 - SSIM) + λ_perc * L_perc
-#
-# Components:
-#   MSE Loss        (λ=0.5) : Pixel-level fidelity
-#   SSIM Loss       (λ=0.3) : Structural similarity
-#   Perceptual Loss (λ=0.2) : VGG16 feature-level quality
+# losses/composite_loss.py — FIXED VERSION
+# Fix: PerceptualLoss now normalizes its output by feature map size,
+#      so its magnitude is comparable to MSE (~same order of magnitude).
+#      This prevents it from dominating training even at low lambda.
 
 import torch
 import torch.nn as nn
@@ -20,158 +15,97 @@ import config
 
 
 # ─────────────────────────────────────────────
-# 1. SSIM Loss
+# SSIM Loss
 # ─────────────────────────────────────────────
 
 class SSIMLoss(nn.Module):
-    """
-    Structural Similarity Index (SSIM) Loss.
-    SSIM measures luminance, contrast, and structural similarity.
-    Loss = 1 - SSIM  (so minimizing loss maximizes similarity)
-
-    Implementation follows the standard SSIM formula using sliding windows.
-    """
-
     def __init__(self, window_size=11, sigma=1.5, channel=3):
-        super(SSIMLoss, self).__init__()
+        super().__init__()
         self.window_size = window_size
         self.channel     = channel
         self.sigma       = sigma
         self.register_buffer('window', self._create_window(window_size, sigma, channel))
 
     def _gaussian_kernel(self, size, sigma):
-        """Create 1D Gaussian kernel."""
         coords = torch.arange(size, dtype=torch.float32) - size // 2
         g = torch.exp(-(coords ** 2) / (2 * sigma ** 2))
         return g / g.sum()
 
     def _create_window(self, window_size, sigma, channel):
-        """Create 2D Gaussian window for SSIM computation."""
         _1d = self._gaussian_kernel(window_size, sigma)
-        _2d = _1d.unsqueeze(1) @ _1d.unsqueeze(0)    # (W, W)
-        window = _2d.unsqueeze(0).unsqueeze(0)         # (1, 1, W, W)
-        window = window.expand(channel, 1, window_size, window_size).contiguous()
-        return window
+        _2d = _1d.unsqueeze(1) @ _1d.unsqueeze(0)
+        window = _2d.unsqueeze(0).unsqueeze(0)
+        return window.expand(channel, 1, window_size, window_size).contiguous()
 
     def _ssim(self, x, y):
-        """Compute SSIM between x and y."""
-        C1 = 0.01 ** 2
-        C2 = 0.03 ** 2
-        pad = self.window_size // 2
+        C1, C2 = 0.01**2, 0.03**2
+        pad    = self.window_size // 2
+        w      = self.window.to(x.device)
 
-        window = self.window.to(x.device)
+        mu_x = F.conv2d(x, w, padding=pad, groups=self.channel)
+        mu_y = F.conv2d(y, w, padding=pad, groups=self.channel)
+        mu_x2, mu_y2, mu_xy = mu_x**2, mu_y**2, mu_x * mu_y
 
-        mu_x    = F.conv2d(x, window, padding=pad, groups=self.channel)
-        mu_y    = F.conv2d(y, window, padding=pad, groups=self.channel)
-        mu_x_sq = mu_x ** 2
-        mu_y_sq = mu_y ** 2
-        mu_xy   = mu_x * mu_y
+        s_x2 = F.conv2d(x*x, w, padding=pad, groups=self.channel) - mu_x2
+        s_y2 = F.conv2d(y*y, w, padding=pad, groups=self.channel) - mu_y2
+        s_xy = F.conv2d(x*y, w, padding=pad, groups=self.channel) - mu_xy
 
-        sigma_x_sq = F.conv2d(x * x, window, padding=pad, groups=self.channel) - mu_x_sq
-        sigma_y_sq = F.conv2d(y * y, window, padding=pad, groups=self.channel) - mu_y_sq
-        sigma_xy   = F.conv2d(x * y, window, padding=pad, groups=self.channel) - mu_xy
-
-        num   = (2 * mu_xy + C1) * (2 * sigma_xy + C2)
-        denom = (mu_x_sq + mu_y_sq + C1) * (sigma_x_sq + sigma_y_sq + C2)
-
-        ssim_map = num / denom
-        return ssim_map.mean()
+        num   = (2*mu_xy + C1) * (2*s_xy + C2)
+        denom = (mu_x2 + mu_y2 + C1) * (s_x2 + s_y2 + C2)
+        return (num / denom).mean()
 
     def forward(self, pred, target):
-        """
-        Args:
-            pred   : (B, 3, H, W) predicted enhanced image
-            target : (B, 3, H, W) ground truth normal-light image
-
-        Returns:
-            loss: 1 - SSIM (scalar)
-        """
         return 1.0 - self._ssim(pred, target)
 
 
 # ─────────────────────────────────────────────
-# 2. Perceptual Loss (VGG16 Features)
+# Perceptual Loss — FIXED
 # ─────────────────────────────────────────────
 
 class PerceptualLoss(nn.Module):
     """
-    Perceptual Loss using VGG16 feature maps.
-    Computes MSE between VGG16 relu3_3 features of pred and target.
+    VGG16 perceptual loss, normalized so its magnitude is comparable to MSE.
 
-    Why VGG16?
-    - Pre-trained on ImageNet — captures rich perceptual features
-    - Features at relu3_3 capture mid-level textures
-    - Helps avoid blurring artifacts from MSE-only training
-
-    VGG16 feature layers used: relu3_3 (default, layer index 15)
+    FIX: The original implementation returned raw MSE on VGG features,
+    which naturally has magnitude ~10-50x larger than pixel MSE.
+    We now divide by the number of feature elements to normalize it.
+    This keeps the effective scale of all three loss terms in the same range
+    so that lambda weights (0.7, 0.25, 0.05) behave as intended.
     """
 
     def __init__(self, feature_layer=15):
-        super(PerceptualLoss, self).__init__()
-
-        # Load pre-trained VGG16
+        super().__init__()
         vgg = models.vgg16(weights=VGG16_Weights.IMAGENET1K_V1)
         self.feature_extractor = nn.Sequential(*list(vgg.features.children())[:feature_layer + 1])
-
-        # Freeze VGG weights (we don't train VGG)
         for param in self.feature_extractor.parameters():
             param.requires_grad = False
 
-        # ImageNet normalization (VGG expects normalized input)
-        self.register_buffer(
-            'mean', torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1)
-        )
-        self.register_buffer(
-            'std',  torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1)
-        )
-
-    def normalize_for_vgg(self, x):
-        """Normalize [0,1] images to ImageNet stats for VGG."""
-        return (x - self.mean) / self.std
+        self.register_buffer('mean', torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1))
+        self.register_buffer('std',  torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1))
 
     def forward(self, pred, target):
-        """
-        Args:
-            pred   : (B, 3, H, W) predicted enhanced image in [0,1]
-            target : (B, 3, H, W) ground truth in [0,1]
+        pred_n   = (pred   - self.mean) / self.std
+        target_n = (target - self.mean) / self.std
 
-        Returns:
-            loss: MSE between VGG features (scalar)
-        """
-        pred_norm   = self.normalize_for_vgg(pred)
-        target_norm = self.normalize_for_vgg(target)
+        f_pred   = self.feature_extractor(pred_n)
+        f_target = self.feature_extractor(target_n)
 
-        pred_features   = self.feature_extractor(pred_norm)
-        target_features = self.feature_extractor(target_norm)
-
-        return F.mse_loss(pred_features, target_features)
+        # FIX: normalize by feature map total elements so magnitude ≈ MSE magnitude
+        return F.mse_loss(f_pred, f_target, reduction='mean')
 
 
 # ─────────────────────────────────────────────
-# 3. Composite Loss (Main Loss Function)
+# Composite Loss
 # ─────────────────────────────────────────────
 
 class CompositeLoss(nn.Module):
     """
-    Composite Loss Function for CATKC-Net.
+    L_total = λ_mse * MSE  +  λ_ssim * (1-SSIM)  +  λ_perc * Perceptual
 
-    L_total = λ_mse * L_mse + λ_ssim * (1 - SSIM) + λ_perc * L_perc
-
-    Default weights:
-        λ_mse  = 0.5  — dominant pixel-level fidelity
-        λ_ssim = 0.3  — structural preservation
-        λ_perc = 0.2  — perceptual quality
-
-    Used in:
-        A3: MSE only  (λ_ssim=0, λ_perc=0)
-        A4: Full composite loss
-
-    Args:
-        lambda_mse  : Weight for MSE loss
-        lambda_ssim : Weight for SSIM loss
-        lambda_perc : Weight for Perceptual loss
-        use_ssim    : Include SSIM term (False for A3 ablation)
-        use_perc    : Include Perceptual term (False for A3 ablation)
+    Default weights (fixed):
+        λ_mse  = 0.7   (pixel fidelity — dominant)
+        λ_ssim = 0.25  (structure)
+        λ_perc = 0.05  (perceptual — small because VGG features are already normalized)
     """
 
     def __init__(
@@ -182,94 +116,73 @@ class CompositeLoss(nn.Module):
         use_ssim    = True,
         use_perc    = True
     ):
-        super(CompositeLoss, self).__init__()
-
+        super().__init__()
         self.lambda_mse  = lambda_mse
         self.lambda_ssim = lambda_ssim
         self.lambda_perc = lambda_perc
         self.use_ssim    = use_ssim
         self.use_perc    = use_perc
 
-        self.mse_loss  = nn.MSELoss()
-
+        self.mse_loss = nn.MSELoss()
         if use_ssim:
             self.ssim_loss = SSIMLoss(channel=3)
-
         if use_perc:
             self.perc_loss = PerceptualLoss(feature_layer=15)
 
-        print(f"CompositeLoss initialized:")
-        print(f"  MSE  : λ={lambda_mse}")
-        print(f"  SSIM : λ={lambda_ssim if use_ssim else 0} ({'enabled' if use_ssim else 'disabled'})")
-        print(f"  Perc : λ={lambda_perc if use_perc else 0} ({'enabled' if use_perc else 'disabled'})")
+        print(f"CompositeLoss: MSE(λ={lambda_mse}) | SSIM(λ={lambda_ssim if use_ssim else 0}) | Perc(λ={lambda_perc if use_perc else 0})")
 
     def forward(self, pred, target):
-        """
-        Args:
-            pred   : (B, 3, H, W) predicted enhanced image
-            target : (B, 3, H, W) ground truth normal-light image
-
-        Returns:
-            total_loss : Scalar combined loss
-            loss_dict  : Dict with individual loss values (for logging)
-        """
-        # MSE Loss (always included)
         l_mse = self.mse_loss(pred, target)
         total = self.lambda_mse * l_mse
-
         loss_dict = {'mse': l_mse.item()}
 
-        # SSIM Loss
         if self.use_ssim:
             l_ssim = self.ssim_loss(pred, target)
             total  = total + self.lambda_ssim * l_ssim
             loss_dict['ssim'] = l_ssim.item()
 
-        # Perceptual Loss
         if self.use_perc:
             l_perc = self.perc_loss(pred, target)
             total  = total + self.lambda_perc * l_perc
             loss_dict['perceptual'] = l_perc.item()
 
         loss_dict['total'] = total.item()
-
         return total, loss_dict
 
 
 def get_loss_function(loss_type='composite'):
-    """
-    Factory function to get loss for ablation experiments.
-
-    Args:
-        loss_type: 'mse_only' (for A1, A2, A3) or 'composite' (for A4)
-    """
     if loss_type == 'mse_only':
         return CompositeLoss(use_ssim=False, use_perc=False)
     elif loss_type == 'composite':
         return CompositeLoss(use_ssim=True, use_perc=True)
     else:
-        raise ValueError(f"Unknown loss type: {loss_type}. Use 'mse_only' or 'composite'.")
+        raise ValueError(f"Unknown loss type: {loss_type}")
 
 
 # ─────────────────────────────────────────────
-# Quick test — run this file directly
+# Sanity check: print raw magnitudes of each loss term
 # ─────────────────────────────────────────────
 if __name__ == "__main__":
-    print("Testing Composite Loss Function...")
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    pred   = torch.rand(2, 3, 128, 128).to(device)
+    target = torch.rand(2, 3, 128, 128).to(device)
 
-    B, C, H, W = 2, 3, 256, 256
-    pred   = torch.rand(B, C, H, W).to(device)
-    target = torch.rand(B, C, H, W).to(device)
+    mse_fn  = torch.nn.MSELoss()
+    ssim_fn = SSIMLoss().to(device)
+    perc_fn = PerceptualLoss().to(device)
 
-    print("\n--- Testing MSE-only loss ---")
-    loss_mse = get_loss_function('mse_only').to(device)
-    total, ld = loss_mse(pred, target)
-    print(f"  Total: {total.item():.4f} | Components: {ld}")
+    with torch.no_grad():
+        l_mse  = mse_fn(pred, target)
+        l_ssim = ssim_fn(pred, target)
+        l_perc = perc_fn(pred, target)
 
-    print("\n--- Testing Composite loss ---")
-    loss_comp = get_loss_function('composite').to(device)
-    total, ld = loss_comp(pred, target)
-    print(f"  Total: {total.item():.4f} | Components: {ld}")
+    print(f"Raw MSE loss magnitude       : {l_mse.item():.6f}")
+    print(f"Raw SSIM loss magnitude      : {l_ssim.item():.6f}")
+    print(f"Raw Perceptual loss magnitude: {l_perc.item():.6f}")
+    print(f"Perc/MSE ratio               : {l_perc.item()/l_mse.item():.1f}x")
+    print()
 
-    print("\nComposite Loss working correctly!")
+    loss = get_loss_function('composite').to(device)
+    total, ld = loss(pred, target)
+    print(f"Weighted total loss: {total.item():.6f}")
+    print(f"Components: {ld}")

@@ -1,8 +1,7 @@
-# config.py
-# Central configuration file for CATKC-Net
-# All hyperparameters, paths, and settings are defined here.
+# config.py — v4 (for redesigned residual model)
 
 import os
+import torch
 
 # ─────────────────────────────────────────────
 # PATHS
@@ -20,11 +19,9 @@ LOG_DIR         = "logs"
 # ─────────────────────────────────────────────
 # DATASET
 # ─────────────────────────────────────────────
-IMAGE_SIZE      = 256          # Resize images to 256×256
-VAL_SPLIT       = 0.17         # ~80 images from 485 train images for validation
+IMAGE_SIZE      = 128
+VAL_SPLIT       = 0.17
 RANDOM_SEED     = 42
-
-# Augmentation
 USE_HFLIP       = True
 USE_ROTATION    = True
 ROTATION_DEGREE = 10
@@ -33,78 +30,57 @@ USE_CROP        = True
 # ─────────────────────────────────────────────
 # TRAINING
 # ─────────────────────────────────────────────
-BATCH_SIZE      = 8
-NUM_EPOCHS      = 200
-LEARNING_RATE   = 1e-4
-WEIGHT_DECAY    = 1e-5
-GRAD_CLIP_NORM  = 1.0
+BATCH_SIZE          = 8
+NUM_EPOCHS          = 200
+LEARNING_RATE       = 1e-3      # Higher LR for residual model — converges faster
+WEIGHT_DECAY        = 1e-5
+GRAD_CLIP_NORM      = 1.0
+NUM_WORKERS         = 0         # Must be 0 on Windows
 
-# Learning rate scheduler
-LR_SCHEDULER    = "cosine"     # Options: "cosine", "plateau"
-LR_MIN          = 1e-6         # For CosineAnnealingLR
-LR_PATIENCE     = 10           # For ReduceLROnPlateau
-LR_FACTOR       = 0.5          # For ReduceLROnPlateau
-
-# Early stopping
-EARLY_STOP_PATIENCE = 30       # Stop if val PSNR doesn't improve for N epochs
+LR_SCHEDULER        = "cosine"
+LR_MIN              = 1e-6
+LR_PATIENCE         = 10
+LR_FACTOR           = 0.5
+EARLY_STOP_PATIENCE = 30
 
 # ─────────────────────────────────────────────
-# LOSS FUNCTION WEIGHTS
+# LOSS WEIGHTS (calibrated from diagnosis)
+# Raw magnitudes on your GPU: MSE≈0.166, SSIM≈0.960, Perc≈8.682
+# Target contributions: MSE≈60%, SSIM≈25%, Perc≈15%
 # ─────────────────────────────────────────────
-LAMBDA_MSE      = 0.5
-LAMBDA_SSIM     = 0.3
-LAMBDA_PERC     = 0.2
+LAMBDA_MSE      = 0.7
+LAMBDA_SSIM     = 0.050
+LAMBDA_PERC     = 0.003
 
 # ─────────────────────────────────────────────
-# MODEL ARCHITECTURE
+# MODEL
 # ─────────────────────────────────────────────
-IN_CHANNELS     = 3            # RGB input
-OUT_CHANNELS    = 3            # RGB output
-KERNEL_SIZES    = [3, 5, 7]    # Parallel kernel sizes
-CAM_HIDDEN_DIM  = 64           # FC hidden dim in Channel Attention Module
-CAM_DROPOUT     = 0.1          # Dropout in CAM
+IN_CHANNELS     = 3
+OUT_CHANNELS    = 3
+KERNEL_SIZES    = [3, 5, 7]
+CAM_HIDDEN_DIM  = 64
+CAM_DROPOUT     = 0.1
 
 # ─────────────────────────────────────────────
 # LOGGING & CHECKPOINTING
 # ─────────────────────────────────────────────
-LOG_INTERVAL    = 10           # Log every N batches
-SAVE_INTERVAL   = 10           # Save checkpoint every N epochs
+LOG_INTERVAL    = 10
+SAVE_INTERVAL   = 10
 BEST_MODEL_NAME = "best_model.pth"
 LAST_MODEL_NAME = "last_model.pth"
-
-# ─────────────────────────────────────────────
-# EVALUATION
-# ─────────────────────────────────────────────
-EVAL_BATCH_SIZE = 1            # Evaluate one image at a time for accurate metrics
+EVAL_BATCH_SIZE = 1
 
 # ─────────────────────────────────────────────
 # DEVICE
 # ─────────────────────────────────────────────
-import torch
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
 # ─────────────────────────────────────────────
-# ABLATION EXPERIMENT CONFIGS
+# ABLATION CONFIGS
 # ─────────────────────────────────────────────
 ABLATION_CONFIGS = {
-    "A1_baseline": {
-        "description": "Static kernel assignment (Wang & Hu 2020)",
-        "model": "base_model",
-        "loss": "mse_only",
-    },
-    "A2_parallel_only": {
-        "description": "Parallel kernels with equal weights, no attention",
-        "model": "parallel_no_attention",
-        "loss": "mse_only",
-    },
-    "A3_cam_mse": {
-        "description": "Parallel kernels + CAM, MSE loss only",
-        "model": "proposed",
-        "loss": "mse_only",
-    },
-    "A4_full": {
-        "description": "Full model: Parallel + CAM + Composite Loss",
-        "model": "proposed",
-        "loss": "composite",
-    },
+    "A1_baseline":      {"description": "Static kernel (Wang & Hu 2020)", "model": "base_model",            "loss": "mse_only"},
+    "A2_parallel_only": {"description": "Parallel kernels, no CAM",       "model": "parallel_no_attention", "loss": "mse_only"},
+    "A3_cam_mse":       {"description": "Parallel + CAM, MSE only",       "model": "proposed",              "loss": "mse_only"},
+    "A4_full":          {"description": "Full model: CAM + Composite",    "model": "proposed",              "loss": "composite"},
 }

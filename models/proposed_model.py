@@ -1,11 +1,20 @@
-# models/proposed_model.py
-# CATKC-Net: Content-Adaptive Trapezoidal Kernel CNN
-# Our proposed model that replaces static kernel assignment with
-# dynamic Channel Attention Module (CAM) for multi-scale kernel fusion.
+# models/proposed_model.py — REDESIGNED v4
 #
-# Key difference from base paper:
-#   Base paper: Static kernel per channel (determined offline via MSD)
-#   Ours      : Parallel 3×3/5×5/7×7 with learned attention weights
+# ROOT CAUSE OF STUCK AT 8.38 dB:
+# The "Enhanced = Input - NoiseMap" formulation is wrong for LOL dataset.
+# LOL images are genuinely DARK (mean pixel ~0.1-0.2). Ground truth is BRIGHT (mean ~0.5-0.7).
+# To go from dark to bright, you need to ADD light, not subtract noise.
+# A noise map initialized near 0 → output ≈ input → PSNR vs bright GT = ~8 dB.
+# The model gets stuck because subtracting anything makes it worse.
+#
+# FIX: Replace noise subtraction with DIRECT enhancement output.
+# The network directly predicts the enhanced image (like an encoder-decoder).
+# The final layer uses Sigmoid so output is in [0,1].
+# This lets the network freely learn to brighten, sharpen, and restore.
+#
+# Secondary fix: Add skip connection from input to output so the network
+# learns the RESIDUAL (enhancement delta) rather than the full image.
+# This is standard practice in image restoration (DnCNN, DPED, etc.)
 
 import torch
 import torch.nn as nn
@@ -14,115 +23,120 @@ import torch.nn.functional as F
 import sys, os
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import config
-from models.attention import MultiScaleParallelConv, ChannelAttentionModule
+from models.attention import MultiScaleParallelConv
 
 
 class CharacteristicActivationLayer(nn.Module):
-    """
-    Layer 1: Characteristic Activation Layer
-    Extracts initial features (shared with base paper).
-    """
-    def __init__(self, in_channels=3, out_channels=64):
+    def __init__(self, in_channels, out_channels):
         super().__init__()
-        self.conv = nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1, bias=True)
-        self.bn   = nn.BatchNorm2d(out_channels)
-        self.act  = nn.ReLU(inplace=True)
+        self.block = nn.Sequential(
+            nn.Conv2d(in_channels, out_channels, 3, padding=1, bias=False),
+            nn.BatchNorm2d(out_channels),
+            nn.LeakyReLU(0.2, inplace=True)
+        )
+    def forward(self, x):
+        return self.block(x)
+
+
+class ResidualBlock(nn.Module):
+    """Standard residual block for high-dim mapping."""
+    def __init__(self, channels):
+        super().__init__()
+        self.block = nn.Sequential(
+            nn.Conv2d(channels, channels, 3, padding=1, bias=False),
+            nn.BatchNorm2d(channels),
+            nn.LeakyReLU(0.2, inplace=True),
+            nn.Conv2d(channels, channels, 3, padding=1, bias=False),
+            nn.BatchNorm2d(channels),
+        )
+        self.act = nn.LeakyReLU(0.2, inplace=True)
 
     def forward(self, x):
-        return self.act(self.bn(self.conv(x)))
+        return self.act(x + self.block(x))
 
 
 class HighDimMappingLayer(nn.Module):
-    """
-    Layer 2: High-Dimensional Mapping Layer
-    Multiple stacked conv layers for better feature representation.
-    Includes residual connections for better gradient flow.
-    """
     def __init__(self, channels=64, n_layers=5):
         super().__init__()
-        self.layers = nn.ModuleList([
-            nn.Sequential(
-                nn.Conv2d(channels, channels, kernel_size=3, padding=1, bias=False),
-                nn.BatchNorm2d(channels),
-                nn.ReLU(inplace=True)
-            )
-            for _ in range(n_layers)
-        ])
+        self.blocks = nn.ModuleList([ResidualBlock(channels) for _ in range(n_layers)])
 
     def forward(self, x):
-        for layer in self.layers:
-            x = x + layer(x)   # Residual connection
+        for block in self.blocks:
+            x = block(x)
         return x
 
 
-class ImageGenerationLayer(nn.Module):
+class EnhancementOutputLayer(nn.Module):
     """
-    Layer 3: Image Generation Layer (Deconvolution)
-    Reconstructs noise map from feature maps.
+    REDESIGNED output layer.
+
+    Instead of predicting a noise map to subtract, we predict
+    a RESIDUAL enhancement delta in range [-0.5, 0.5] and ADD it to input.
+
+    Enhanced = clamp(Input + Residual, 0, 1)
+
+    Why residual (not direct output)?
+    - Network only needs to learn the CORRECTION, not reconstruct the full image
+    - Gradients flow more easily (smaller target values)
+    - Natural identity initialization: residual=0 → output=input
+
+    Initialization:
+    - Final conv weights → near zero (via xavier with small gain)
+    - Final conv bias   → zero
+    - This means residual ≈ 0 at start → output ≈ input
+    - PSNR at start will be ~8 dB (input vs GT), which is correct —
+      the model will then LEARN to push it higher by adding brightness.
     """
     def __init__(self, in_channels=64, out_channels=3):
         super().__init__()
-        self.deconv = nn.Sequential(
-            nn.ConvTranspose2d(in_channels, 32, kernel_size=3, padding=1, bias=True),
-            nn.ReLU(inplace=True),
-            nn.ConvTranspose2d(32, out_channels, kernel_size=3, padding=1, bias=True),
-            nn.Sigmoid()    # Noise map in [0, 1]
-        )
+        self.conv1  = nn.Conv2d(in_channels, 32, 3, padding=1, bias=True)
+        self.act    = nn.LeakyReLU(0.2, inplace=True)
+        self.conv2  = nn.Conv2d(32, out_channels, 3, padding=1, bias=True)
+        self.tanh   = nn.Tanh()   # Output in [-1, 1]; we scale to [-0.5, 0.5]
+
+        # Initialize final layer to near-zero so residual starts small
+        nn.init.xavier_normal_(self.conv2.weight, gain=0.01)
+        nn.init.zeros_(self.conv2.bias)
 
     def forward(self, x):
-        return self.deconv(x)
+        x = self.act(self.conv1(x))
+        residual = self.tanh(self.conv2(x)) * 0.5   # Scale to [-0.5, 0.5]
+        return residual
 
 
 class CATKCNet(nn.Module):
     """
-    CATKC-Net: Content-Adaptive Trapezoidal Kernel CNN (Proposed Model)
+    CATKC-Net v4: Content-Adaptive Trapezoidal Kernel CNN.
 
-    Architecture Overview:
-    ┌─────────────────────────────────────────────────────┐
-    │  Input (B, 3, H, W)                                 │
-    │        ↓                                            │
-    │  MultiScaleParallelConv ← OUR KEY INNOVATION        │
-    │  ┌──────────────────────────────────────────────┐   │
-    │  │  ┌──────────┐  ┌──────────┐  ┌──────────┐   │   │
-    │  │  │ Conv 3×3 │  │ Conv 5×5 │  │ Conv 7×7 │   │   │
-    │  │  └──────────┘  └──────────┘  └──────────┘   │   │
-    │  │         ↓            ↓            ↓           │   │
-    │  │  ┌────────────────────────────────────────┐  │   │
-    │  │  │    Channel Attention Module (CAM)       │  │   │
-    │  │  │  GAP → FC(64) → ReLU → FC(3) → Softmax │  │   │
-    │  │  │    w3   w5   w7  (learned weights)      │  │   │
-    │  │  └────────────────────────────────────────┘  │   │
-    │  │         ↓  Weighted Sum Fusion               │   │
-    │  └──────────────────────────────────────────────┘   │
-    │        ↓  (B, 64, H, W)                             │
-    │  CharacteristicActivationLayer                      │
-    │        ↓                                            │
-    │  HighDimMappingLayer (with residuals)               │
-    │        ↓                                            │
-    │  ImageGenerationLayer → Noise Map (B, 3, H, W)      │
-    │        ↓                                            │
-    │  Enhanced = clamp(Input - Noise Map, 0, 1)          │
-    └─────────────────────────────────────────────────────┘
+    Pipeline:
+        Input (low-light, dark image)
+            ↓
+        MultiScaleParallelConv + CAM  ← Our innovation
+            ↓
+        CharacteristicActivationLayer
+            ↓
+        HighDimMappingLayer (residual blocks)
+            ↓
+        EnhancementOutputLayer → Residual ∈ [-0.5, 0.5]
+            ↓
+        Enhanced = clamp(Input + Residual, 0, 1)
 
-    This is used for:
-        A3: With CAM, MSE loss only
-        A4: With CAM, Composite loss (full proposed model)
+    The network learns to ADD brightness/detail to dark images.
+    Positive residual = brightening. Negative = tone-down highlights.
     """
 
     def __init__(
         self,
-        in_channels=3,
-        feature_channels=64,
-        n_layers=5,
-        cam_hidden_dim=64,
-        cam_dropout=0.1,
-        use_attention=True     # If False → equal-weight fusion (ablation A2)
+        in_channels      = 3,
+        feature_channels = 64,
+        n_layers         = 5,
+        cam_hidden_dim   = 64,
+        cam_dropout      = 0.1,
+        use_attention    = True
     ):
         super(CATKCNet, self).__init__()
-
         self.use_attention = use_attention
 
-        # ── Our core innovation: Parallel Multi-Scale Conv + CAM ──
         if use_attention:
             self.multi_scale = MultiScaleParallelConv(
                 in_channels=in_channels,
@@ -131,128 +145,91 @@ class CATKCNet(nn.Module):
                 dropout=cam_dropout
             )
         else:
-            # A2: Parallel kernels with equal weights (no attention)
+            # A2: equal-weight parallel kernels, no attention
             self.conv3x3 = nn.Sequential(
-                nn.Conv2d(in_channels, feature_channels, kernel_size=3, padding=1, bias=False),
-                nn.BatchNorm2d(feature_channels), nn.ReLU(inplace=True)
+                nn.Conv2d(in_channels, feature_channels, 3, padding=1, bias=False),
+                nn.BatchNorm2d(feature_channels), nn.LeakyReLU(0.2, inplace=True)
             )
             self.conv5x5 = nn.Sequential(
-                nn.Conv2d(in_channels, feature_channels, kernel_size=5, padding=2, bias=False),
-                nn.BatchNorm2d(feature_channels), nn.ReLU(inplace=True)
+                nn.Conv2d(in_channels, feature_channels, 5, padding=2, bias=False),
+                nn.BatchNorm2d(feature_channels), nn.LeakyReLU(0.2, inplace=True)
             )
             self.conv7x7 = nn.Sequential(
-                nn.Conv2d(in_channels, feature_channels, kernel_size=7, padding=3, bias=False),
-                nn.BatchNorm2d(feature_channels), nn.ReLU(inplace=True)
+                nn.Conv2d(in_channels, feature_channels, 7, padding=3, bias=False),
+                nn.BatchNorm2d(feature_channels), nn.LeakyReLU(0.2, inplace=True)
             )
 
-        # ── Remaining layers (same as base paper) ──
-        self.char_act = CharacteristicActivationLayer(
-            in_channels=feature_channels,
-            out_channels=feature_channels
-        )
-        self.high_dim = HighDimMappingLayer(channels=feature_channels, n_layers=n_layers)
-        self.img_gen  = ImageGenerationLayer(in_channels=feature_channels, out_channels=in_channels)
+        self.char_act   = CharacteristicActivationLayer(feature_channels, feature_channels)
+        self.high_dim   = HighDimMappingLayer(feature_channels, n_layers)
+        self.output_layer = EnhancementOutputLayer(feature_channels, in_channels)
 
     def forward(self, x):
         """
         Args:
-            x: (B, 3, H, W) — weak contrast (low-light) input image in [0, 1]
-
+            x: (B, 3, H, W) low-light input in [0, 1]
         Returns:
-            enhanced  : (B, 3, H, W) — enhanced output in [0, 1]
-            noise_map : (B, 3, H, W) — predicted noise map
-            weights   : (B, 3) or None — attention weights [w3, w5, w7]
-                        (None if use_attention=False)
+            enhanced : (B, 3, H, W) enhanced image in [0, 1]
+            residual : (B, 3, H, W) enhancement map in [-0.5, 0.5]
+            weights  : (B, 3) attention weights [w3, w5, w7], or None
         """
-        # ── Dynamic multi-scale feature extraction ──
         if self.use_attention:
-            feat, weights = self.multi_scale(x)    # (B, 64, H, W), (B, 3)
+            feat, weights = self.multi_scale(x)
         else:
-            # Equal-weight fusion (ablation A2)
-            out3 = self.conv3x3(x)
-            out5 = self.conv5x5(x)
-            out7 = self.conv7x7(x)
-            feat    = (out3 + out5 + out7) / 3.0   # Simple average
+            feat    = (self.conv3x3(x) + self.conv5x5(x) + self.conv7x7(x)) / 3.0
             weights = None
 
-        # ── Subsequent processing ──
-        feat = self.char_act(feat)
-        feat = self.high_dim(feat)
+        feat     = self.char_act(feat)
+        feat     = self.high_dim(feat)
+        residual = self.output_layer(feat)
 
-        # ── Noise map prediction ──
-        noise_map = self.img_gen(feat)
+        # ADD residual to input (network learns to brighten dark images)
+        enhanced = torch.clamp(x + residual, 0.0, 1.0)
 
-        # ── Final enhancement: Enhanced = Input - Noise Map ──
-        enhanced = torch.clamp(x - noise_map, 0.0, 1.0)
-
-        return enhanced, noise_map, weights
+        return enhanced, residual, weights
 
     def count_parameters(self):
-        total = sum(p.numel() for p in self.parameters() if p.requires_grad)
-        mode = "with CAM" if self.use_attention else "parallel only (no CAM)"
-        print(f"CATKCNet ({mode}) — Total trainable parameters: {total:,}")
-        return total
-
-    def get_attention_weights_for_batch(self, x):
-        """
-        Helper: Run a batch through the model and return attention weights.
-        Useful for visualization.
-
-        Returns:
-            weights_np: numpy array of shape (B, 3) — [w3, w5, w7] per image
-        """
-        self.eval()
-        with torch.no_grad():
-            _, _, weights = self.forward(x)
-        if weights is not None:
-            return weights.cpu().numpy()
-        return None
+        n = sum(p.numel() for p in self.parameters() if p.requires_grad)
+        print(f"CATKCNet ({'CAM' if self.use_attention else 'no CAM'}) — params: {n:,}")
+        return n
 
 
-# ─────────────────────────────────────────────
-# Factory functions for ablation experiments
-# ─────────────────────────────────────────────
-
-def build_model_A2():
-    """A2: Parallel kernels with equal weights, no attention."""
-    return CATKCNet(use_attention=False)
-
-def build_model_A3():
-    """A3: Parallel kernels + CAM (attention). Train with MSE only."""
-    return CATKCNet(use_attention=True)
-
-def build_model_A4():
-    """A4: Full model — Parallel + CAM + Composite loss. Same as A3 but different loss."""
-    return CATKCNet(use_attention=True)
+def build_model_A2(): return CATKCNet(use_attention=False)
+def build_model_A3(): return CATKCNet(use_attention=True)
+def build_model_A4(): return CATKCNet(use_attention=True)
 
 
-# ─────────────────────────────────────────────
-# Quick test — run this file directly
-# ─────────────────────────────────────────────
 if __name__ == "__main__":
-    print("Testing CATKC-Net (Proposed Model)...")
+    import math
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-    # Test full model (A4)
-    model = CATKCNet(use_attention=True).to(device)
+    model  = CATKCNet(use_attention=True).to(device)
     model.count_parameters()
 
-    x = torch.rand(4, 3, 256, 256).to(device)   # Simulated low-light input
-    enhanced, noise_map, weights = model(x)
+    # Simulate a real LOL scenario: dark input (mean ~0.15), bright GT (mean ~0.5)
+    x  = torch.rand(2, 3, 128, 128).to(device) * 0.3        # Dark input
+    gt = torch.rand(2, 3, 128, 128).to(device) * 0.5 + 0.3  # Bright GT
 
-    print(f"\n  Input shape     : {x.shape}")
-    print(f"  Enhanced shape  : {enhanced.shape}")
-    print(f"  Noise map shape : {noise_map.shape}")
-    print(f"  Weights shape   : {weights.shape}")
-    print(f"  Sample weights  : {weights[0].detach().cpu().numpy()}")
-    print(f"  Weights sum     : {weights[0].sum().item():.4f}  (should be ~1.0)")
-    print(f"  Enhanced range  : [{enhanced.min():.3f}, {enhanced.max():.3f}]")
+    with torch.no_grad():
+        enhanced, residual, weights = model(x)
 
-    # Test A2 variant
-    print("\n--- Testing A2 (no attention) ---")
-    model_a2 = build_model_A2().to(device)
-    model_a2.count_parameters()
-    enhanced_a2, _, w_a2 = model_a2(x)
-    print(f"  Weights (A2): {w_a2}  (should be None)")
+    res_mean   = residual.mean().item()
+    res_range  = (residual.min().item(), residual.max().item())
+    input_mean = x.mean().item()
+    enh_mean   = enhanced.mean().item()
 
-    print("\nAdaptive CNN working correctly!")
+    mse_input    = ((x - gt)**2).mean().item()
+    mse_enhanced = ((enhanced - gt)**2).mean().item()
+    psnr_input    = -10*math.log10(mse_input + 1e-10)
+    psnr_enhanced = -10*math.log10(mse_enhanced + 1e-10)
+
+    print(f"\nInput mean    : {input_mean:.3f}  (dark)")
+    print(f"Enhanced mean : {enh_mean:.3f}  (should be ≈ input at init)")
+    print(f"Residual mean : {res_mean:.4f}  (should be ≈ 0 at init)")
+    print(f"Residual range: [{res_range[0]:.4f}, {res_range[1]:.4f}]")
+    print(f"PSNR (input vs GT)   : {psnr_input:.1f} dB")
+    print(f"PSNR (enhanced vs GT): {psnr_enhanced:.1f} dB  (≈ same as input at init)")
+    print(f"Weights: {weights[0].detach().cpu().numpy()}")
+
+    if abs(res_mean) < 0.05:
+        print("\n✓ Model initialized correctly — ready to train!")
+    else:
+        print("\n✗ Residual not near zero at init")
