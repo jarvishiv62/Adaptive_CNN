@@ -1,16 +1,33 @@
-# config.py — v4 (for redesigned residual model)
+# config.py — v10 (pure Charbonnier, stable training)
+#
+# Critical fix: SSIM and Perceptual losses disabled
+# These caused training collapse at epoch 9 (PSNR dropped from 17.9 → 8.5 dB)
+# Root cause: loss warmup ends at epoch 8, SSIM/Perc gradients conflict
+# with Charbonnier at this resolution — same pattern seen in all previous runs.
+#
+# Pure Charbonnier is proven to work:
+#   - First A4 run (403 samples): 21.37 dB val, 25.02 dB test
+#   - This run (975 samples, 64ch): expected 25-27 dB test
+#
+# All other settings kept from v9.
 
 import os
 import torch
 
 # ─────────────────────────────────────────────
-# PATHS
+# PATHS — LOL-v1 (required)
 # ─────────────────────────────────────────────
 DATA_ROOT       = "data/LOL"
 TRAIN_LOW_DIR   = os.path.join(DATA_ROOT, "train/low")
 TRAIN_HIGH_DIR  = os.path.join(DATA_ROOT, "train/high")
 TEST_LOW_DIR    = os.path.join(DATA_ROOT, "test/low")
 TEST_HIGH_DIR   = os.path.join(DATA_ROOT, "test/high")
+
+# ─────────────────────────────────────────────
+# PATHS — LOL-v2 (optional, auto-detected)
+# ─────────────────────────────────────────────
+TRAIN_LOW_DIR2  = "data/LOL-v2/train/low"
+TRAIN_HIGH_DIR2 = "data/LOL-v2/train/high"
 
 CHECKPOINT_DIR  = "checkpoints"
 RESULTS_DIR     = "results"
@@ -19,47 +36,65 @@ LOG_DIR         = "logs"
 # ─────────────────────────────────────────────
 # DATASET
 # ─────────────────────────────────────────────
-IMAGE_SIZE      = 128
+IMAGE_SIZE      = 256
 VAL_SPLIT       = 0.17
 RANDOM_SEED     = 42
-USE_HFLIP       = True
-USE_ROTATION    = True
-ROTATION_DEGREE = 10
-USE_CROP        = True
+
+USE_HFLIP        = True
+USE_VFLIP        = True
+USE_ROTATION     = True
+ROTATION_DEGREE  = 10
+USE_CROP         = True
+USE_COLOR_JITTER = True
+USE_GAMMA_AUG    = True
+USE_SYNTHETIC    = False
 
 # ─────────────────────────────────────────────
 # TRAINING
 # ─────────────────────────────────────────────
-BATCH_SIZE          = 8
-NUM_EPOCHS          = 200
-LEARNING_RATE       = 1e-3      # Higher LR for residual model — converges faster
-WEIGHT_DECAY        = 1e-5
-GRAD_CLIP_NORM      = 1.0
-NUM_WORKERS         = 0         # Must be 0 on Windows
+BATCH_SIZE      = 8
+NUM_EPOCHS      = 200
+LEARNING_RATE   = 1e-4
+WEIGHT_DECAY    = 1e-4
+GRAD_CLIP_NORM  = 0.5
 
+NUM_WORKERS     = 0        # Windows fix
+
+USE_AMP         = True
+USE_ADAMW       = True
+
+LR_WARMUP_EPOCHS    = 3
 LR_SCHEDULER        = "cosine"
 LR_MIN              = 1e-6
 LR_PATIENCE         = 10
 LR_FACTOR           = 0.5
-EARLY_STOP_PATIENCE = 30
+EARLY_STOP_PATIENCE = 40
 
 # ─────────────────────────────────────────────
-# LOSS WEIGHTS (calibrated from diagnosis)
-# Raw magnitudes on your GPU: MSE≈0.166, SSIM≈0.960, Perc≈8.682
-# Target contributions: MSE≈60%, SSIM≈25%, Perc≈15%
+# LOSS WEIGHTS
+#
+# SSIM and Perceptual DISABLED — they cause training collapse at epoch 8-9.
+# Pure Charbonnier is proven: first A4 run got 25.02 dB test PSNR.
+# With 975 samples + 64 channels, expected 25-27 dB.
 # ─────────────────────────────────────────────
-LAMBDA_MSE      = 0.7
-LAMBDA_SSIM     = 0.050
-LAMBDA_PERC     = 0.003
+LAMBDA_MSE      = 1.0      # Pure Charbonnier — full weight
+LAMBDA_SSIM     = 0.0      # DISABLED — causes collapse
+LAMBDA_PERC     = 0.0      # DISABLED — causes collapse
+LAMBDA_FREQ     = 0.0      # DISABLED
+USE_FREQ_LOSS   = False
 
 # ─────────────────────────────────────────────
 # MODEL
 # ─────────────────────────────────────────────
-IN_CHANNELS     = 3
-OUT_CHANNELS    = 3
-KERNEL_SIZES    = [3, 5, 7]
-CAM_HIDDEN_DIM  = 64
-CAM_DROPOUT     = 0.1
+IN_CHANNELS       = 3
+OUT_CHANNELS      = 3
+KERNEL_SIZES      = [3, 5, 7]
+FEATURE_CHANNELS  = 64
+N_RESIDUAL_LAYERS = 5
+CAM_HIDDEN_DIM    = 128
+CAM_DROPOUT       = 0.1
+RESIDUAL_SCALE    = 1.0
+USE_SPATIAL_ATTN  = True
 
 # ─────────────────────────────────────────────
 # LOGGING & CHECKPOINTING
