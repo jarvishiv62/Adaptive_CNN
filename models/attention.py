@@ -1,215 +1,176 @@
 # models/attention.py
-# Channel Attention Module (CAM) for CATKC-Net
-# Squeeze-and-Excitation style attention that learns optimal
-# fusion weights (w3, w5, w7) for each kernel output per RGB channel.
+# Channel Attention Module (CAM) — core innovation of CATKC-Net
+#
+# Architecture:
+#   MultiScaleParallelConv: runs 3×3, 5×5, 7×7 convolutions in parallel
+#   ChannelAttentionModule: GAP → FC → ReLU → FC → Softmax → weights [w3, w5, w7]
+#   SpatialAttentionModule: optional spatial refinement after channel attention
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-import sys, os
-sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import config
-
-
-class ChannelAttentionModule(nn.Module):
-    """
-    Channel Attention Module (CAM) for dynamic kernel weight fusion.
-
-    Architecture:
-        Input: Concatenation of three kernel outputs → shape (B, 3*C, H, W)
-        1. Global Average Pooling      → (B, 3*C, 1, 1)
-        2. Squeeze (reshape)           → (B, 3*C)
-        3. FC(3*C → hidden_dim) + ReLU → (B, hidden_dim)
-        4. Dropout for regularization  → (B, hidden_dim)
-        5. FC(hidden_dim → n_kernels)  → (B, n_kernels)  [n_kernels = 3]
-        6. Softmax                     → (B, 3)  — weights sum to 1
-
-    The weights w3, w5, w7 ∈ [0, 1] are then used to fuse the
-    three parallel kernel outputs with a weighted sum.
-
-    Why this design:
-    - Lightweight: only ~200 parameters extra
-    - Interpretable: weights directly tell us which kernel the network prefers
-    - End-to-end learnable: no offline statistics needed
-    """
-
-    def __init__(self, in_channels, n_kernels=3, hidden_dim=64, dropout=0.1):
-        """
-        Args:
-            in_channels : Number of channels in each kernel output (e.g., 64)
-            n_kernels   : Number of parallel kernels (default: 3 → 3×3, 5×5, 7×7)
-            hidden_dim  : FC hidden layer dimension (default: 64)
-            dropout     : Dropout probability for regularization (default: 0.1)
-        """
-        super(ChannelAttentionModule, self).__init__()
-
-        self.n_kernels   = n_kernels
-        self.in_channels = in_channels
-        total_channels   = in_channels * n_kernels
-
-        # Global Average Pooling (spatial squeeze)
-        self.gap = nn.AdaptiveAvgPool2d(1)
-
-        # Fully connected attention network
-        self.attention_fc = nn.Sequential(
-            nn.Linear(total_channels, hidden_dim),
-            nn.ReLU(inplace=True),
-            nn.Dropout(p=dropout),
-            nn.Linear(hidden_dim, n_kernels),
-        )
-
-        # Softmax to get normalized weights (sum to 1)
-        self.softmax = nn.Softmax(dim=1)
-
-        # Initialize weights for stable training
-        self._initialize_weights()
-
-    def _initialize_weights(self):
-        """Initialize FC layers with small weights for stable early training."""
-        for m in self.modules():
-            if isinstance(m, nn.Linear):
-                nn.init.xavier_uniform_(m.weight)
-                if m.bias is not None:
-                    nn.init.zeros_(m.bias)
-
-    def forward(self, kernel_outputs):
-        """
-        Args:
-            kernel_outputs: List of 3 tensors, each of shape (B, C, H, W)
-                           [out_3x3, out_5x5, out_7x7]
-
-        Returns:
-            fused   : Attention-weighted sum of kernel outputs, shape (B, C, H, W)
-            weights : Attention weights (w3, w5, w7), shape (B, 3)
-                      Useful for visualization
-        """
-        assert len(kernel_outputs) == self.n_kernels, \
-            f"Expected {self.n_kernels} kernel outputs, got {len(kernel_outputs)}"
-
-        B, C, H, W = kernel_outputs[0].shape
-
-        # Concatenate along channel dimension: (B, 3*C, H, W)
-        concat = torch.cat(kernel_outputs, dim=1)
-
-        # Global Average Pooling: (B, 3*C, 1, 1) → (B, 3*C)
-        squeezed = self.gap(concat).view(B, -1)
-
-        # FC layers to get raw scores: (B, 3)
-        scores = self.attention_fc(squeezed)
-
-        # Softmax to get weights that sum to 1: (B, 3)
-        weights = self.softmax(scores)
-
-        # Weighted fusion: sum over kernels
-        # weights[:, k] has shape (B,), need to broadcast to (B, C, H, W)
-        fused = sum(
-            weights[:, k].view(B, 1, 1, 1) * kernel_outputs[k]
-            for k in range(self.n_kernels)
-        )
-
-        return fused, weights
-
-    def get_weight_names(self):
-        """Returns human-readable names for attention weights."""
-        sizes = [3, 5, 7][:self.n_kernels]
-        return [f"w{s}x{s}" for s in sizes]
 
 
 class MultiScaleParallelConv(nn.Module):
     """
-    Parallel Multi-Scale Convolution Block.
-
-    Applies 3×3, 5×5, 7×7 convolutions in parallel on the input,
-    then uses CAM to dynamically fuse the outputs.
-
-    This replaces the static MSD-based kernel assignment in the base paper.
+    Runs 3 parallel convolutions (3×3, 5×5, 7×7) on the same input.
+    Returns concatenated features and individual branch outputs.
     """
 
-    def __init__(self, in_channels, out_channels, hidden_dim=64, dropout=0.1):
-        """
-        Args:
-            in_channels  : Input channels
-            out_channels : Output channels (same for all three parallel convolutions)
-            hidden_dim   : CAM hidden layer size
-            dropout      : CAM dropout rate
-        """
-        super(MultiScaleParallelConv, self).__init__()
+    def __init__(self, in_channels, out_channels):
+        super().__init__()
 
-        self.out_channels = out_channels
-
-        # Three parallel convolutions with same-size output (via padding)
-        # padding = kernel_size // 2 ensures output H,W = input H,W
-        self.conv3x3 = nn.Sequential(
+        self.branch3 = nn.Sequential(
             nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1, bias=False),
             nn.BatchNorm2d(out_channels),
-            nn.ReLU(inplace=True)
+            nn.ReLU(inplace=True),
         )
-        self.conv5x5 = nn.Sequential(
+        self.branch5 = nn.Sequential(
             nn.Conv2d(in_channels, out_channels, kernel_size=5, padding=2, bias=False),
             nn.BatchNorm2d(out_channels),
-            nn.ReLU(inplace=True)
+            nn.ReLU(inplace=True),
         )
-        self.conv7x7 = nn.Sequential(
+        self.branch7 = nn.Sequential(
             nn.Conv2d(in_channels, out_channels, kernel_size=7, padding=3, bias=False),
             nn.BatchNorm2d(out_channels),
-            nn.ReLU(inplace=True)
-        )
-
-        # Channel Attention Module for fusion
-        self.cam = ChannelAttentionModule(
-            in_channels=out_channels,
-            n_kernels=3,
-            hidden_dim=hidden_dim,
-            dropout=dropout
+            nn.ReLU(inplace=True),
         )
 
     def forward(self, x):
-        """
-        Args:
-            x : Input tensor (B, C_in, H, W)
-
-        Returns:
-            fused   : Attention-fused output (B, C_out, H, W)
-            weights : Attention weights (B, 3) — [w3, w5, w7]
-        """
-        # Apply parallel convolutions
-        out3 = self.conv3x3(x)
-        out5 = self.conv5x5(x)
-        out7 = self.conv7x7(x)
-
-        # Fuse with channel attention
-        fused, weights = self.cam([out3, out5, out7])
-
-        return fused, weights
+        f3 = self.branch3(x)
+        f5 = self.branch5(x)
+        f7 = self.branch7(x)
+        # concat for downstream CAM input
+        fused = torch.cat([f3, f5, f7], dim=1)   # [B, 3*C, H, W]
+        return fused, f3, f5, f7
 
 
-# ─────────────────────────────────────────────
-# Quick test — run this file directly
-# ─────────────────────────────────────────────
+class ChannelAttentionModule(nn.Module):
+    """
+    SE-style channel attention that produces soft weights [w3, w5, w7]
+    for blending the three parallel convolution branches.
+
+    Input : concatenated features [B, 3*C, H, W]
+    Output: weighted fused features [B, C, H, W] + weights [B, 3]
+    """
+
+    def __init__(self, feature_channels, hidden_dim=None, dropout=0.1):
+        super().__init__()
+        in_dim     = feature_channels * 3
+        hidden_dim = hidden_dim or in_dim // 4
+
+        self.gap = nn.AdaptiveAvgPool2d(1)   # Global Average Pooling
+
+        self.fc = nn.Sequential(
+            nn.Linear(in_dim, hidden_dim),
+            nn.ReLU(inplace=True),
+            nn.Dropout(p=dropout),
+            nn.Linear(hidden_dim, 3),        # 3 weights: w3, w5, w7
+        )
+
+    def forward(self, fused, f3, f5, f7):
+        B, _, H, W = f3.shape
+
+        # GAP over concatenated features → [B, 3C]
+        gap_out = self.gap(fused).view(B, -1)
+
+        # Soft weights via FC + Softmax → [B, 3]
+        weights = F.softmax(self.fc(gap_out), dim=1)
+
+        w3 = weights[:, 0].view(B, 1, 1, 1)
+        w5 = weights[:, 1].view(B, 1, 1, 1)
+        w7 = weights[:, 2].view(B, 1, 1, 1)
+
+        # Weighted blend → [B, C, H, W]
+        out = w3 * f3 + w5 * f5 + w7 * f7
+
+        return out, weights
+
+
+class SpatialAttentionModule(nn.Module):
+    """
+    Simple spatial attention: learns where in the image to focus.
+    Applied after channel attention for additional refinement.
+    """
+
+    def __init__(self, kernel_size=7):
+        super().__init__()
+        padding = kernel_size // 2
+        self.conv = nn.Conv2d(2, 1, kernel_size=kernel_size, padding=padding, bias=False)
+
+    def forward(self, x):
+        avg_out = torch.mean(x, dim=1, keepdim=True)
+        max_out, _ = torch.max(x, dim=1, keepdim=True)
+        spatial = torch.cat([avg_out, max_out], dim=1)
+        attn_map = torch.sigmoid(self.conv(spatial))
+        return x * attn_map
+
+
+class CAMBlock(nn.Module):
+    """
+    Full attention block combining:
+        MultiScaleParallelConv → ChannelAttentionModule → (optional) SpatialAttentionModule
+
+    This is the core building block of CATKC-Net.
+    """
+
+    def __init__(
+        self,
+        in_channels,
+        feature_channels = None,
+        hidden_dim       = None,
+        dropout          = None,
+        use_spatial      = None,
+    ):
+        super().__init__()
+        feature_channels = feature_channels or config.FEATURE_CHANNELS
+        hidden_dim       = hidden_dim       or config.CAM_HIDDEN_DIM
+        dropout          = dropout          if dropout is not None else config.CAM_DROPOUT
+        use_spatial      = use_spatial      if use_spatial is not None else config.USE_SPATIAL_ATTN
+
+        self.ms_conv = MultiScaleParallelConv(in_channels, feature_channels)
+        self.cam     = ChannelAttentionModule(feature_channels, hidden_dim, dropout)
+        self.spatial = SpatialAttentionModule() if use_spatial else None
+
+        # Project back to in_channels if needed
+        self.proj = (
+            nn.Conv2d(feature_channels, in_channels, kernel_size=1, bias=False)
+            if feature_channels != in_channels else nn.Identity()
+        )
+
+    def forward(self, x):
+        fused, f3, f5, f7 = self.ms_conv(x)
+        out, weights       = self.cam(fused, f3, f5, f7)
+
+        if self.spatial is not None:
+            out = self.spatial(out)
+
+        out = self.proj(out)
+
+        # Residual connection
+        out = out + x
+
+        return out, weights
+
+
 if __name__ == "__main__":
-    print("Testing Channel Attention Module...")
+    print("Testing attention modules...")
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    B, C_in, C_out, H, W = 4, 3, 64, 256, 256
+    x = torch.randn(4, 64, 256, 256)
 
-    # Test CAM alone
-    cam = ChannelAttentionModule(in_channels=C_out, n_kernels=3, hidden_dim=64).to(device)
-    dummy_outputs = [torch.randn(B, C_out, H, W).to(device) for _ in range(3)]
-    fused, weights = cam(dummy_outputs)
-    print(f"  CAM input  : 3 × (B={B}, C={C_out}, H={H}, W={W})")
-    print(f"  CAM fused  : {fused.shape}")
-    print(f"  CAM weights: {weights.shape}  (sum = {weights.sum(dim=1).mean():.4f})")
-    print(f"  Sample weights: {weights[0].detach().cpu().numpy()}")
+    ms = MultiScaleParallelConv(64, 64)
+    fused, f3, f5, f7 = ms(x)
+    print(f"  MultiScaleParallelConv: fused={fused.shape}, f3={f3.shape}")
 
-    # Test MultiScale block
-    msc = MultiScaleParallelConv(in_channels=C_in, out_channels=C_out).to(device)
-    x = torch.randn(B, C_in, H, W).to(device)
-    out, w = msc(x)
-    print(f"\n  MultiScaleParallelConv output: {out.shape}")
-    print(f"  Attention weights: {w[0].detach().cpu().numpy()}")
+    cam = ChannelAttentionModule(64)
+    out, w = cam(fused, f3, f5, f7)
+    print(f"  CAM out: {out.shape}, weights: {w.shape}")
+    print(f"  Weight sum (should be 1.0): {w[0].sum().item():.4f}")
 
-    # Count parameters
-    total_params = sum(p.numel() for p in msc.parameters() if p.requires_grad)
-    print(f"\n  Total parameters in MultiScaleParallelConv: {total_params:,}")
-    print("\nChannel Attention Module working correctly!")
+    block = CAMBlock(64)
+    out, w = block(x)
+    print(f"  CAMBlock out: {out.shape}, weights: {w[0].detach().numpy()}")
+
+    print("Attention modules OK!")

@@ -9,12 +9,13 @@ B.Tech Final Year Research Project
 
 We extend Wang & Hu (2020) by replacing their **static kernel assignment** (based on offline MSD computation) with a **dynamic Channel Attention Module (CAM)** that learns optimal multi-scale kernel fusion at runtime.
 
-| Component | Base Paper | Ours (CATKC-Net) |
-|-----------|-----------|-----------------|
-| Kernel selection | Static (offline MSD) | Dynamic (learned CAM) |
-| Kernel processing | One kernel per channel | Parallel 3×3+5×5+7×7 |
-| Loss function | MSE only | MSE + SSIM + Perceptual |
-| Attention | None | SE-style Channel Attention |
+| Component         | Base Paper             | Ours (CATKC-Net)               |
+| ----------------- | ---------------------- | ------------------------------ |
+| Kernel selection  | Static (offline MSD)   | Dynamic (learned CAM)          |
+| Kernel processing | One kernel per channel | Parallel 3×3+5×5+7×7           |
+| Loss function     | MSE only               | MSE + SSIM + Perceptual        |
+| Attention         | None                   | SE-style Channel Attention     |
+| Training          | Basic                  | Resume-safe with checkpointing |
 
 ---
 
@@ -36,13 +37,14 @@ Adaptive CNN/
 ├── losses/
 │   └── composite_loss.py       ← MSE + SSIM + Perceptual loss
 ├── checkpoints/                ← Saved weights (auto-created)
-├── results/                    ← Output images (auto-created)
+├── results/                    ← Output images & metrics (auto-created)
 ├── logs/                       ← TensorBoard logs (auto-created)
 ├── config.py                   ← All hyperparameters
-├── trainer.py                  ← Training loop
-├── evaluate.py                 ← Evaluation + metrics
-├── ablation.py                 ← Run ablation experiments
+├── trainer.py                  ← Training loop with resume support
+├── evaluate.py                 ← Evaluation + metrics + ablation comparison
+├── ablation.py                 ← Resume-safe ablation experiments
 ├── utils.py                    ← Metrics, visualization helpers
+├── check_gpu_detailed.py       ← GPU detection and troubleshooting
 ├── requirements.txt
 └── README.md
 ```
@@ -54,17 +56,24 @@ Adaptive CNN/
 ### 1. Setup Environment
 
 ```bash
-git clone https://github.com/Adaptive_CNN.git
+git clone https://github.com/jarvishiv62/Adaptive_CNN.git
 cd Adaptive_CNN
 python -m venv venv
 source venv/bin/activate          # Windows: venv\Scripts\activate
 pip install -r requirements.txt
 ```
 
-### 2. Download LOL Dataset
+### 2. Check GPU Setup
+
+```bash
+python check_gpu_detailed.py
+```
+
+### 3. Download LOL Dataset
 
 Go to https://daooshee.github.io/BMVC2018website/ and download the LOL dataset.
 Extract to `data/LOL/` so you have:
+
 ```
 data/LOL/train/low/   ← ~485 low-light images
 data/LOL/train/high/  ← ~485 normal-light images
@@ -72,22 +81,24 @@ data/LOL/test/low/    ← 15 test images
 data/LOL/test/high/   ← 15 test images
 ```
 
-### 3. Train Full Model (A4)
+### 4. Train Full Model (A4)
 
 ```bash
 python trainer.py
+# Training is resume-safe - press Ctrl+C anytime, re-run to resume
 ```
 
-### 4. Run All Ablation Experiments
+### 5. Run All Ablation Experiments
 
 ```bash
 python ablation.py --exp all
+# Resume-safe - experiments automatically resume if interrupted
 # Or run one at a time:
 python ablation.py --exp A1
 python ablation.py --exp A4
 ```
 
-### 5. Evaluate on Test Set
+### 6. Evaluate on Test Set
 
 ```bash
 # Evaluate specific model
@@ -97,7 +108,7 @@ python evaluate.py --model proposed --checkpoint checkpoints/A4_full_model/best_
 python evaluate.py --ablation
 ```
 
-### 6. Monitor Training
+### 7. Monitor Training
 
 ```bash
 tensorboard --logdir=logs/
@@ -106,14 +117,24 @@ tensorboard --logdir=logs/
 
 ---
 
+## New Features (Latest Update)
+
+✅ **Resume-Safe Training** - All experiments support automatic resumption from checkpoints  
+✅ **Smart Checkpointing** - Detects completed vs incomplete training runs  
+✅ **Enhanced Logging** - Better progress reporting and status messages  
+✅ **GPU Diagnostics** - Comprehensive GPU detection and troubleshooting tool  
+✅ **Clean Project Structure** - Removed duplicate files and improved organization
+
+---
+
 ## Ablation Study
 
-| ID | Configuration | Loss |
-|----|--------------|------|
-| A1 | Static kernel (base paper) | MSE |
-| A2 | Parallel kernels, equal weights | MSE |
-| A3 | Parallel kernels + CAM | MSE |
-| A4 | Parallel kernels + CAM (Full) | MSE+SSIM+Perceptual |
+| ID  | Configuration                   | Loss                |
+| --- | ------------------------------- | ------------------- |
+| A1  | Static kernel (base paper)      | MSE                 |
+| A2  | Parallel kernels, equal weights | MSE                 |
+| A3  | Parallel kernels + CAM          | MSE                 |
+| A4  | Parallel kernels + CAM (Full)   | MSE+SSIM+Perceptual |
 
 ---
 
@@ -138,14 +159,14 @@ L_total = 0.5 × L_mse  +  0.3 × (1 - SSIM)  +  0.2 × L_perceptual
 
 ## Expected Results (LOL-v1 Test Set)
 
-| Method | PSNR (dB) | SSIM | LPIPS |
-|--------|-----------|------|-------|
-| A1 (Baseline) | ~17.5 | ~0.72 | ~0.30 |
-| A2 (+Parallel) | ~17.9 | ~0.74 | ~0.28 |
-| A3 (+CAM) | ~18.3 | ~0.76 | ~0.25 |
-| A4 (Full - Ours) | ~18.8 | ~0.78 | ~0.22 |
+| Method           | PSNR (dB) | SSIM  | LPIPS |
+| ---------------- | --------- | ----- | ----- |
+| A1 (Baseline)    | ~17.5     | ~0.72 | ~0.30 |
+| A2 (+Parallel)   | ~17.9     | ~0.74 | ~0.28 |
+| A3 (+CAM)        | ~18.3     | ~0.76 | ~0.25 |
+| A4 (Full - Ours) | ~18.8     | ~0.78 | ~0.22 |
 
-*Actual numbers will vary based on training run. Fill in from your experiments.*
+_Actual numbers will vary based on training run. Fill in from your experiments._
 
 ---
 
@@ -161,6 +182,7 @@ L_total = 0.5 × L_mse  +  0.3 × (1 - SSIM)  +  0.2 × L_perceptual
 ## Citation
 
 Base paper:
+
 ```
 @article{wang2020improved,
   title={An Improved Enhancement Algorithm Based on CNN Applicable for Weak Contrast Images},
