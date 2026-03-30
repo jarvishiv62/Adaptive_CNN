@@ -1,117 +1,104 @@
-# models/base_model.py
-# Baseline model: Wang & Hu (2020) — static kernel assignment
-#
-# Paper: "An Improved Enhancement Algorithm Based on CNN Applicable
-#         for Weak Contrast Images" — IEEE Access 2020
-#
-# Key difference from CATKC-Net:
-#   - Kernel selection is STATIC (based on offline MSD computation)
-#   - One fixed kernel per channel group
-#   - No channel attention, no multi-scale fusion
-#   - MSE loss only
-#
-# This is A1 in the ablation study.
+# models/base_model.py — REDESIGNED v4
+# Updated to use residual addition (same as proposed model) for fair comparison.
+# The only difference from proposed model: static kernel assignment (no CAM).
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
+import numpy as np
 
-import config
+
+class StaticTrapezoidalConvBlock(nn.Module):
+    """
+    Wang & Hu (2020) static kernel assignment.
+    R→5×5, G→7×7, B→3×3 (default for natural images where G has highest MSD).
+    """
+    def __init__(self, in_channels=3, out_channels=64, kernel_assignment=None):
+        super().__init__()
+        if kernel_assignment is None:
+            kernel_assignment = {0: 5, 1: 7, 2: 3}  # R:5x5, G:7x7, B:3x3
+        self.kernel_assignment = kernel_assignment
+
+        self.channel_convs = nn.ModuleDict()
+        for ch_idx, k_size in kernel_assignment.items():
+            self.channel_convs[str(ch_idx)] = nn.Sequential(
+                nn.Conv2d(1, out_channels, kernel_size=k_size, padding=k_size//2, bias=False),
+                nn.BatchNorm2d(out_channels),
+                nn.LeakyReLU(0.2, inplace=True)
+            )
+        self.fusion = nn.Conv2d(out_channels * in_channels, out_channels, 1, bias=False)
+
+    def forward(self, x):
+        feats = []
+        for ch_idx in sorted(self.kernel_assignment.keys()):
+            ch_input = x[:, ch_idx:ch_idx+1, :, :]
+            feats.append(self.channel_convs[str(ch_idx)](ch_input))
+        return self.fusion(torch.cat(feats, dim=1))
 
 
 class ResidualBlock(nn.Module):
-    """Standard residual block with two 3×3 convolutions."""
-
-    def __init__(self, channels, residual_scale=1.0):
+    def __init__(self, channels):
         super().__init__()
-        self.residual_scale = residual_scale
         self.block = nn.Sequential(
-            nn.Conv2d(channels, channels, kernel_size=3, padding=1, bias=False),
+            nn.Conv2d(channels, channels, 3, padding=1, bias=False),
             nn.BatchNorm2d(channels),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(channels, channels, kernel_size=3, padding=1, bias=False),
+            nn.LeakyReLU(0.2, inplace=True),
+            nn.Conv2d(channels, channels, 3, padding=1, bias=False),
             nn.BatchNorm2d(channels),
         )
-        self.relu = nn.ReLU(inplace=True)
+        self.act = nn.LeakyReLU(0.2, inplace=True)
 
     def forward(self, x):
-        return self.relu(x + self.residual_scale * self.block(x))
+        return self.act(x + self.block(x))
 
 
 class BaselineModel(nn.Module):
     """
-    Wang & Hu 2020 baseline: Static trapezoidal kernel CNN.
-
-    Architecture:
-        Input (3ch) → Conv3×3 → [N residual blocks] → Conv3×3 → Output (3ch)
-
-    Uses a single fixed 3×3 kernel throughout (static assignment).
-    No attention mechanism, no multi-scale fusion.
+    Wang & Hu (2020) re-implementation with residual output formulation.
+    Uses static kernel assignment; everything else matches proposed model.
     """
-
-    def __init__(
-        self,
-        in_channels      = None,
-        out_channels     = None,
-        feature_channels = None,
-        n_residual       = None,
-        residual_scale   = None,
-    ):
+    def __init__(self, kernel_assignment=None):
         super().__init__()
-        in_channels      = in_channels      or config.IN_CHANNELS
-        out_channels     = out_channels     or config.OUT_CHANNELS
-        feature_channels = feature_channels or config.FEATURE_CHANNELS
-        n_residual       = n_residual       or config.N_RESIDUAL_LAYERS
-        residual_scale   = residual_scale   if residual_scale is not None else config.RESIDUAL_SCALE
+        self.trapezoidal = StaticTrapezoidalConvBlock(3, 64, kernel_assignment)
 
-        # Encoder
-        self.head = nn.Sequential(
-            nn.Conv2d(in_channels, feature_channels, kernel_size=3, padding=1, bias=False),
-            nn.BatchNorm2d(feature_channels),
-            nn.ReLU(inplace=True),
+        self.char_act = nn.Sequential(
+            nn.Conv2d(64, 64, 3, padding=1, bias=False),
+            nn.BatchNorm2d(64),
+            nn.LeakyReLU(0.2, inplace=True)
         )
+        self.high_dim = nn.ModuleList([ResidualBlock(64) for _ in range(5)])
 
-        # Residual body (static 3×3 only)
-        self.body = nn.Sequential(
-            *[ResidualBlock(feature_channels, residual_scale) for _ in range(n_residual)]
-        )
+        self.output_conv1 = nn.Conv2d(64, 32, 3, padding=1, bias=True)
+        self.output_act   = nn.LeakyReLU(0.2, inplace=True)
+        self.output_conv2 = nn.Conv2d(32, 3,  3, padding=1, bias=True)
+        self.tanh         = nn.Tanh()
 
-        # Decoder
-        self.tail = nn.Sequential(
-            nn.Conv2d(feature_channels, feature_channels, kernel_size=3, padding=1, bias=False),
-            nn.BatchNorm2d(feature_channels),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(feature_channels, out_channels, kernel_size=3, padding=1, bias=True),
-        )
-
-        self._init_weights()
-
-    def _init_weights(self):
-        for m in self.modules():
-            if isinstance(m, nn.Conv2d):
-                nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
-                if m.bias is not None:
-                    nn.init.zeros_(m.bias)
-            elif isinstance(m, nn.BatchNorm2d):
-                nn.init.ones_(m.weight)
-                nn.init.zeros_(m.bias)
+        nn.init.xavier_normal_(self.output_conv2.weight, gain=0.01)
+        nn.init.zeros_(self.output_conv2.bias)
 
     def forward(self, x):
-        feat = self.head(x)
-        feat = self.body(feat)
-        out  = self.tail(feat)
-        # Residual learning: predict enhancement delta
-        out  = torch.clamp(x + out, 0.0, 1.0)
-        return out
+        feat = self.trapezoidal(x)
+        feat = self.char_act(feat)
+        for block in self.high_dim:
+            feat = block(feat)
+
+        residual = self.tanh(self.output_act(self.output_conv1(feat)))
+        residual = self.tanh(self.output_conv2(
+            self.output_act(self.output_conv1(feat))
+        )) * 0.5
+
+        enhanced = torch.clamp(x + residual, 0.0, 1.0)
+        return enhanced, residual
+
+    def count_parameters(self):
+        n = sum(p.numel() for p in self.parameters() if p.requires_grad)
+        print(f"BaselineModel — params: {n:,}")
+        return n
 
 
 if __name__ == "__main__":
-    print("Testing BaselineModel...")
     model = BaselineModel()
-    x = torch.randn(2, 3, 256, 256)
-    out = model(x)
-    print(f"  Input : {x.shape}")
-    print(f"  Output: {out.shape}")
-    n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print(f"  Params: {n_params:,}")
+    model.count_parameters()
+    x = torch.rand(2, 3, 128, 128)
+    enhanced, residual = model(x)
+    print(f"Output: {enhanced.shape}, residual mean: {residual.mean():.4f}")
     print("BaselineModel OK!")
