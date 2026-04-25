@@ -296,3 +296,4 @@ if __name__ == "__main__":
 
     trainer = Trainer(model, loss_fn, train_loader, val_loader, experiment_name='A4_full_model')
     trainer.train()
+    
